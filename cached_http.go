@@ -32,7 +32,15 @@ const (
 	// defaultNegativeTTL is how long a 204 ("no certificate here") response is
 	// remembered when no negative_ttl is configured.
 	defaultNegativeTTL = 60 * time.Second
+
+	// fetchTimeout bounds an upstream certificate fetch so a slow backend
+	// cannot block TLS handshakes indefinitely.
+	fetchTimeout = 10 * time.Second
 )
+
+// httpClient is shared across getter instances so connections are reused. Its
+// timeout bounds each upstream fetch.
+var httpClient = &http.Client{Timeout: fetchTimeout}
 
 func init() {
 	caddy.RegisterModule(new(CachedHTTPGetter))
@@ -230,13 +238,16 @@ func (g *CachedHTTPGetter) GetCertificate(ctx context.Context, hello *tls.Client
 		return entry.cert, nil
 	}
 
+	// The handshake ctx is intentionally NOT propagated to the fetch: if the
+	// leader handshake's ctx is canceled (client disconnects), we must not
+	// cancel a singleflight fetch that other coalesced handshakes are waiting on.
 	result, err, _ := g.group.Do(sni, func() (any, error) {
 		// Another goroutine may have populated the cache while we waited on
 		// singleflight; re-check before paying for an HTTP request.
 		if entry, ok := g.load(sni); ok {
 			return fetchResult{cert: entry.cert, negative: entry.negative}, nil
 		}
-		return g.fetch(ctx, sni, hello)
+		return g.fetch(sni, hello)
 	})
 	if err != nil {
 		return nil, err
@@ -249,9 +260,20 @@ func (g *CachedHTTPGetter) GetCertificate(ctx context.Context, hello *tls.Client
 	return res.cert, nil
 }
 
+// requestContext returns the base context for an upstream fetch. It uses the
+// module's lifetime context (canceled on shutdown) rather than the
+// per-handshake context, so that one client disconnecting cannot cancel a
+// singleflight fetch that other handshakes are waiting on.
+func (g *CachedHTTPGetter) requestContext() context.Context {
+	if g.ctx.Context != nil {
+		return g.ctx
+	}
+	return context.Background()
+}
+
 // fetch queries the upstream URL for sni and caches the outcome. The request
 // shape mirrors Caddy's stock tls.get_certificate.http getter.
-func (g *CachedHTTPGetter) fetch(ctx context.Context, sni string, hello *tls.ClientHelloInfo) (fetchResult, error) {
+func (g *CachedHTTPGetter) fetch(sni string, hello *tls.ClientHelloInfo) (fetchResult, error) {
 	sigs := make([]string, len(hello.SignatureSchemes))
 	for i, sig := range hello.SignatureSchemes {
 		sigs[i] = fmt.Sprintf("%x", uint16(sig))
@@ -276,12 +298,12 @@ func (g *CachedHTTPGetter) fetch(ctx context.Context, sni string, hello *tls.Cli
 	}
 	parsed.RawQuery = qs.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	req, err := http.NewRequestWithContext(g.requestContext(), http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return fetchResult{}, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fetchResult{}, err
 	}
@@ -291,6 +313,8 @@ func (g *CachedHTTPGetter) fetch(ctx context.Context, sni string, hello *tls.Cli
 		g.store(sni, &cacheEntry{negative: true, expires: g.now().Add(g.negativeTTL())})
 		return fetchResult{negative: true}, nil
 	}
+	// Deliberately do not cache errors: a transient upstream failure should
+	// self-heal on the next handshake rather than be pinned for a TTL.
 	if resp.StatusCode != http.StatusOK {
 		return fetchResult{}, fmt.Errorf("got HTTP %d", resp.StatusCode)
 	}

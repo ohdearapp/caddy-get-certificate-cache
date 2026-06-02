@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -312,5 +313,60 @@ func TestGetCertificateSingleflightCollapsesConcurrentMisses(t *testing.T) {
 
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("upstream hits = %d, want 1 (singleflight must collapse concurrent misses)", got)
+	}
+}
+
+func TestFetchSendsStockQueryParams(t *testing.T) {
+	var gotQuery url.Values
+	bundle := testPEMBundle(t, "status.example.com")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.Write(bundle)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+	hello := &tls.ClientHelloInfo{
+		ServerName:       "status.example.com",
+		SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+		CipherSuites:     []uint16{tls.TLS_AES_128_GCM_SHA256},
+	}
+
+	if _, err := g.GetCertificate(context.Background(), hello); err != nil {
+		t.Fatalf("GetCertificate: %v", err)
+	}
+
+	if got := gotQuery.Get("server_name"); got != "status.example.com" {
+		t.Errorf("server_name = %q, want status.example.com", got)
+	}
+	if got := gotQuery.Get("signature_schemes"); got != "403" {
+		t.Errorf("signature_schemes = %q, want 403 (hex of ECDSAWithP256AndSHA256)", got)
+	}
+	if got := gotQuery.Get("cipher_suites"); got != "1301" {
+		t.Errorf("cipher_suites = %q, want 1301 (hex of TLS_AES_128_GCM_SHA256)", got)
+	}
+	if _, ok := gotQuery["local_ip"]; ok {
+		t.Error("local_ip should be absent when hello.Conn is nil")
+	}
+}
+
+func TestGetCertificateIgnoresCanceledHandshakeContext(t *testing.T) {
+	bundle := testPEMBundle(t, "status.example.com")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bundle)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before the handshake calls in
+
+	cert, err := g.GetCertificate(ctx, helloFor("status.example.com"))
+	if err != nil {
+		t.Fatalf("a canceled handshake context must not fail the fetch: %v", err)
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		t.Fatal("expected a certificate despite the canceled handshake context")
 	}
 }
