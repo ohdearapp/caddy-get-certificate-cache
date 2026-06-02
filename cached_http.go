@@ -25,8 +25,7 @@ import (
 
 const (
 	// defaultTTL is used for a cached certificate when neither an explicit ttl
-	// is configured nor an s-maxage is present on the response. It matches the
-	// staleness bound of the Varnish layer it replaces.
+	// is configured nor an s-maxage is present on the response.
 	defaultTTL = 60 * time.Second
 
 	// defaultNegativeTTL is how long a 204 ("no certificate here") response is

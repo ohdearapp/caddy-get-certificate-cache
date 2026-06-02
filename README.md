@@ -1,4 +1,4 @@
-# caddy-cached-cert
+# caddy-get-certificate-cache
 
 A [Caddy](https://caddyserver.com) module that caches `get_certificate` results in-process, so
 externally-provided TLS certificates are served from memory instead of being re-fetched over HTTP
@@ -22,28 +22,17 @@ hot path becomes a map lookup (microseconds) instead of an HTTP request.
 
 ## Install
 
-Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy). The Go module
-path matches the repository (`github.com/ohdearapp/get-certificate-cache`):
+Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy):
 
 ```bash
-xcaddy build --with github.com/ohdearapp/get-certificate-cache
+xcaddy build --with github.com/ohdearapp/caddy-get-certificate-cache
 ```
 
-This repository is **private**, so `xcaddy` (which runs `go get` under the hood) needs to be able to
-fetch it. Either give Go access to the private repo:
+To build against a local checkout (for development), point the module at it with a `replace`:
 
 ```bash
-export GOPRIVATE=github.com/ohdearapp/*
-# plus git credentials, e.g.:
-git config --global url."git@github.com:".insteadOf "https://github.com/"
-xcaddy build --with github.com/ohdearapp/get-certificate-cache
-```
-
-or build from a local clone using a module `replace`:
-
-```bash
-git clone git@github.com:ohdearapp/get-certificate-cache.git
-xcaddy build --with github.com/ohdearapp/get-certificate-cache=./get-certificate-cache
+git clone https://github.com/ohdearapp/caddy-get-certificate-cache.git
+xcaddy build --with github.com/ohdearapp/caddy-get-certificate-cache=./caddy-get-certificate-cache
 ```
 
 > Because the module is compiled into Caddy, upgrading Caddy means re-running `xcaddy` with the
