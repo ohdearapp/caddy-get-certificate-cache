@@ -1,4 +1,4 @@
-# caddy-cached-cert
+# caddy-get-certificate-cache
 
 A [Caddy](https://caddyserver.com) module that caches `get_certificate` results in-process, so
 externally-provided TLS certificates are served from memory instead of being re-fetched over HTTP
@@ -25,14 +25,14 @@ hot path becomes a map lookup (microseconds) instead of an HTTP request.
 Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy):
 
 ```bash
-xcaddy build --with github.com/ohdearapp/get-certificate-cache
+xcaddy build --with github.com/ohdearapp/caddy-get-certificate-cache
 ```
 
 To build against a local checkout (for development), point the module at it with a `replace`:
 
 ```bash
-git clone https://github.com/ohdearapp/get-certificate-cache.git
-xcaddy build --with github.com/ohdearapp/get-certificate-cache=./get-certificate-cache
+git clone https://github.com/ohdearapp/caddy-get-certificate-cache.git
+xcaddy build --with github.com/ohdearapp/caddy-get-certificate-cache=./caddy-get-certificate-cache
 ```
 
 > Because the module is compiled into Caddy, upgrading Caddy means re-running `xcaddy` with the

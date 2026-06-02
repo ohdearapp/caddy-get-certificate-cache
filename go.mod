@@ -1,4 +1,4 @@
-module github.com/ohdearapp/get-certificate-cache
+module github.com/ohdearapp/caddy-get-certificate-cache
 
 go 1.25.0
 
