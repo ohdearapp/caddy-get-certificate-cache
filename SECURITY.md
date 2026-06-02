@@ -7,7 +7,7 @@ is configured, writes them to disk. Security reports are taken seriously.
 
 Please **do not** open a public GitHub issue for security problems.
 
-Email **security@ohdear.app** with the details. Include:
+Email **support@ohdear.app** with the details. Include:
 
 - a description of the issue and its impact,
 - steps to reproduce or a proof of concept, and
