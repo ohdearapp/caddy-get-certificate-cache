@@ -1,0 +1,5 @@
+# Build artifacts
+/caddy
+/caddy-cached-cert
+*.test
+*.out
