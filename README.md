@@ -1,5 +1,10 @@
 # caddy-get-certificate-cache
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ohdearapp/caddy-get-certificate-cache.svg)](https://pkg.go.dev/github.com/ohdearapp/caddy-get-certificate-cache)
+[![CI](https://github.com/ohdearapp/caddy-get-certificate-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearapp/caddy-get-certificate-cache/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ohdearapp/caddy-get-certificate-cache)](https://goreportcard.com/report/github.com/ohdearapp/caddy-get-certificate-cache)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A [Caddy](https://caddyserver.com) module that caches `get_certificate` results in-process, so
 externally-provided TLS certificates are served from memory instead of being re-fetched over HTTP
 on every handshake.
