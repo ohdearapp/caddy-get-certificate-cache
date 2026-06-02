@@ -22,10 +22,28 @@ hot path becomes a map lookup (microseconds) instead of an HTTP request.
 
 ## Install
 
-Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy):
+Build Caddy with this module using [xcaddy](https://github.com/caddyserver/xcaddy). The Go module
+path matches the repository (`github.com/ohdearapp/get-certificate-cache`):
 
 ```bash
-xcaddy build --with github.com/ohdear/caddy-cached-cert
+xcaddy build --with github.com/ohdearapp/get-certificate-cache
+```
+
+This repository is **private**, so `xcaddy` (which runs `go get` under the hood) needs to be able to
+fetch it. Either give Go access to the private repo:
+
+```bash
+export GOPRIVATE=github.com/ohdearapp/*
+# plus git credentials, e.g.:
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+xcaddy build --with github.com/ohdearapp/get-certificate-cache
+```
+
+or build from a local clone using a module `replace`:
+
+```bash
+git clone git@github.com:ohdearapp/get-certificate-cache.git
+xcaddy build --with github.com/ohdearapp/get-certificate-cache=./get-certificate-cache
 ```
 
 > Because the module is compiled into Caddy, upgrading Caddy means re-running `xcaddy` with the
