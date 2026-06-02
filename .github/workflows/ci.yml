@@ -45,10 +45,11 @@ jobs:
           check-latest: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.64.8
+          version: v2.12.2
           # Build golangci-lint with the runner's Go toolchain. The prebuilt
-          # v1.64.8 binary is built with go1.24 and refuses to run against this
-          # module's go1.25 target ("build Go < targeted Go").
+          # binaries refuse to run against a module whose go directive is newer
+          # than the Go they were built with ("build Go < targeted Go"), so we
+          # compile from source against this module's go1.25 target.
           install-mode: goinstall
