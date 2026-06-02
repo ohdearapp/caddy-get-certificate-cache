@@ -191,7 +191,7 @@ func TestGetCertificateCachesAfterFirstFetch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/x-pem-file")
-		w.Write(bundle)
+		_, _ = w.Write(bundle)
 	}))
 	defer srv.Close()
 
@@ -218,7 +218,7 @@ func TestGetCertificateRefetchesAfterExpiry(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Cache-Control", "public, s-maxage=60")
-		w.Write(bundle)
+		_, _ = w.Write(bundle)
 	}))
 	defer srv.Close()
 
@@ -292,7 +292,7 @@ func TestGetCertificateSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		<-release
-		w.Write(bundle)
+		_, _ = w.Write(bundle)
 	}))
 	defer srv.Close()
 
@@ -304,7 +304,7 @@ func TestGetCertificateSingleflightCollapsesConcurrentMisses(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			g.GetCertificate(context.Background(), helloFor("status.example.com"))
+			_, _ = g.GetCertificate(context.Background(), helloFor("status.example.com"))
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -321,7 +321,7 @@ func TestFetchSendsStockQueryParams(t *testing.T) {
 	bundle := testPEMBundle(t, "status.example.com")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.Query()
-		w.Write(bundle)
+		_, _ = w.Write(bundle)
 	}))
 	defer srv.Close()
 
@@ -353,7 +353,7 @@ func TestFetchSendsStockQueryParams(t *testing.T) {
 func TestGetCertificateIgnoresCanceledHandshakeContext(t *testing.T) {
 	bundle := testPEMBundle(t, "status.example.com")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(bundle)
+		_, _ = w.Write(bundle)
 	}))
 	defer srv.Close()
 
