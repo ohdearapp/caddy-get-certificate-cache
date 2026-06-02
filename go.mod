@@ -4,13 +4,13 @@ go 1.25.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.2
+	github.com/caddyserver/certmagic v0.25.3
 	go.uber.org/zap v1.27.1
 	golang.org/x/sync v0.20.0
 )
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/caddyserver/certmagic v0.25.3 // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect

@@ -4,8 +4,13 @@
 package cachedcert
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +18,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
@@ -207,13 +213,121 @@ func (g *CachedHTTPGetter) store(sni string, entry *cacheEntry) {
 	g.cache.Store(sni, entry)
 }
 
+type fetchResult struct {
+	cert     *tls.Certificate
+	negative bool
+}
+
+// GetCertificate implements certmagic.Manager. It is called on every TLS
+// handshake, so the hot path is a map lookup; only a miss performs HTTP.
+func (g *CachedHTTPGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	sni := strings.ToLower(hello.ServerName)
+
+	if entry, ok := g.load(sni); ok {
+		if entry.negative {
+			return nil, nil
+		}
+		return entry.cert, nil
+	}
+
+	result, err, _ := g.group.Do(sni, func() (any, error) {
+		// Another goroutine may have populated the cache while we waited on
+		// singleflight; re-check before paying for an HTTP request.
+		if entry, ok := g.load(sni); ok {
+			return fetchResult{cert: entry.cert, negative: entry.negative}, nil
+		}
+		return g.fetch(ctx, sni, hello)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	res := result.(fetchResult)
+	if res.negative {
+		return nil, nil
+	}
+	return res.cert, nil
+}
+
+// fetch queries the upstream URL for sni and caches the outcome. The request
+// shape mirrors Caddy's stock tls.get_certificate.http getter.
+func (g *CachedHTTPGetter) fetch(ctx context.Context, sni string, hello *tls.ClientHelloInfo) (fetchResult, error) {
+	sigs := make([]string, len(hello.SignatureSchemes))
+	for i, sig := range hello.SignatureSchemes {
+		sigs[i] = fmt.Sprintf("%x", uint16(sig))
+	}
+	suites := make([]string, len(hello.CipherSuites))
+	for i, cs := range hello.CipherSuites {
+		suites[i] = fmt.Sprintf("%x", cs)
+	}
+
+	parsed, err := url.Parse(g.URL)
+	if err != nil {
+		return fetchResult{}, err
+	}
+	qs := parsed.Query()
+	qs.Set("server_name", hello.ServerName)
+	qs.Set("signature_schemes", strings.Join(sigs, ","))
+	qs.Set("cipher_suites", strings.Join(suites, ","))
+	if hello.Conn != nil {
+		if localIP, _, err := net.SplitHostPort(hello.Conn.LocalAddr().String()); err == nil && localIP != "" {
+			qs.Set("local_ip", localIP)
+		}
+	}
+	parsed.RawQuery = qs.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return fetchResult{}, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fetchResult{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent {
+		g.store(sni, &cacheEntry{negative: true, expires: g.now().Add(g.negativeTTL())})
+		return fetchResult{negative: true}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fetchResult{}, fmt.Errorf("got HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fetchResult{}, fmt.Errorf("reading response body: %w", err)
+	}
+
+	cert, err := tlsCertFromCertAndKeyPEMBundle(body)
+	if err != nil {
+		return fetchResult{}, err
+	}
+
+	ttl := g.ttlFor(resp.Header.Get("Cache-Control"))
+	g.store(sni, &cacheEntry{cert: &cert, expires: g.now().Add(ttl)})
+
+	if g.CacheDir != "" {
+		if err := g.persist(sni, body); err != nil {
+			g.logger.Warn("persisting certificate to cache_dir failed",
+				zap.String("sni", sni), zap.Error(err))
+		}
+	}
+
+	return fetchResult{cert: &cert}, nil
+}
+
 // Interface guards.
 var (
 	_ caddy.Provisioner     = (*CachedHTTPGetter)(nil)
 	_ caddy.Validator       = (*CachedHTTPGetter)(nil)
 	_ caddyfile.Unmarshaler = (*CachedHTTPGetter)(nil)
-	// _ certmagic.Manager  = (*CachedHTTPGetter)(nil) // re-enabled in Task 4 once GetCertificate exists
+	_ certmagic.Manager     = (*CachedHTTPGetter)(nil)
 )
 
 // loadFromDisk is implemented in disk.go (Task 5). Temporary stub so Task 3 compiles.
 func (g *CachedHTTPGetter) loadFromDisk() error { return nil }
+
+// persist is implemented in disk.go (Task 5). Temporary stub so this compiles.
+func (g *CachedHTTPGetter) persist(sni string, bundle []byte) error { return nil }

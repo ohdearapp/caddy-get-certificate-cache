@@ -1,7 +1,12 @@
 package cachedcert
 
 import (
+	"context"
+	"crypto/tls"
+	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,5 +168,149 @@ func TestUnmarshalCaddyfileRejectsExtraArg(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`cached_http https://app.example.com/cert extra`)
 	if err := g.UnmarshalCaddyfile(d); err == nil {
 		t.Fatal("expected an error for an extra positional argument")
+	}
+}
+
+func newTestGetter(t *testing.T, url string) *CachedHTTPGetter {
+	t.Helper()
+	return &CachedHTTPGetter{
+		URL:   url,
+		cache: new(sync.Map),
+		now:   time.Now,
+	}
+}
+
+func helloFor(host string) *tls.ClientHelloInfo {
+	return &tls.ClientHelloInfo{ServerName: host}
+}
+
+func TestGetCertificateCachesAfterFirstFetch(t *testing.T) {
+	var hits int32
+	bundle := testPEMBundle(t, "status.example.com")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/x-pem-file")
+		w.Write(bundle)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+
+	for i := 0; i < 3; i++ {
+		cert, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+		if err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		if cert == nil || len(cert.Certificate) == 0 {
+			t.Fatalf("handshake %d: expected a certificate", i)
+		}
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (subsequent handshakes must be cached)", got)
+	}
+}
+
+func TestGetCertificateRefetchesAfterExpiry(t *testing.T) {
+	var hits int32
+	bundle := testPEMBundle(t, "status.example.com")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Cache-Control", "public, s-maxage=60")
+		w.Write(bundle)
+	}))
+	defer srv.Close()
+
+	current := time.Now()
+	g := newTestGetter(t, srv.URL)
+	g.now = func() time.Time { return current }
+
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+	current = current.Add(61 * time.Second)
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (expired entry must re-fetch)", got)
+	}
+}
+
+func TestGetCertificateNoContentIsNegativeCached(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+
+	for i := 0; i < 3; i++ {
+		cert, err := g.GetCertificate(context.Background(), helloFor("unknown.example.com"))
+		if err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		if cert != nil {
+			t.Fatalf("handshake %d: expected nil cert for 204", i)
+		}
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (204 must be negative-cached)", got)
+	}
+}
+
+func TestGetCertificateErrorIsNotCached(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+
+	for i := 0; i < 2; i++ {
+		if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err == nil {
+			t.Fatalf("handshake %d: expected an error for HTTP 500", i)
+		}
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (errors must not be cached)", got)
+	}
+}
+
+func TestGetCertificateSingleflightCollapsesConcurrentMisses(t *testing.T) {
+	var hits int32
+	bundle := testPEMBundle(t, "status.example.com")
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-release
+		w.Write(bundle)
+	}))
+	defer srv.Close()
+
+	g := newTestGetter(t, srv.URL)
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			g.GetCertificate(context.Background(), helloFor("status.example.com"))
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (singleflight must collapse concurrent misses)", got)
 	}
 }
