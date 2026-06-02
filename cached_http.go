@@ -231,6 +231,9 @@ type fetchResult struct {
 // GetCertificate implements certmagic.Manager. It is called on every TLS
 // handshake, so the hot path is a map lookup; only a miss performs HTTP.
 func (g *CachedHTTPGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// The cache key and singleflight key are the lowercased SNI, but the
+	// upstream query sends the raw ServerName (matching the stock getter). This
+	// split is deliberate: certificates are name-scoped, not case-scoped.
 	sni := strings.ToLower(hello.ServerName)
 
 	if entry, ok := g.load(sni); ok {
@@ -335,7 +338,7 @@ func (g *CachedHTTPGetter) fetch(sni string, hello *tls.ClientHelloInfo) (fetchR
 	g.store(sni, &cacheEntry{cert: &cert, expires: g.now().Add(ttl)})
 
 	if g.CacheDir != "" {
-		if err := g.persist(sni, body); err != nil {
+		if err := g.persist(sni, body); err != nil && g.logger != nil {
 			g.logger.Warn("persisting certificate to cache_dir failed",
 				zap.String("sni", sni), zap.Error(err))
 		}

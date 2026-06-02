@@ -63,6 +63,8 @@ tls {
 - Concurrent cache misses for the same name are coalesced into a single upstream request.
 - Each upstream fetch is bounded by a 10s timeout, and it does not inherit the per-handshake
   context, so one client disconnecting cannot cancel a fetch that other handshakes are waiting on.
+- Entries loaded from `cache_dir` on startup are re-aged: they get a fresh TTL on load (the
+  original `Cache-Control` is not persisted), so a warm-restart entry re-validates within one TTL.
 
 ## Running the tests
 
