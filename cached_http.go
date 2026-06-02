@@ -177,6 +177,11 @@ func parseSMaxAge(cacheControl string) (time.Duration, bool) {
 			continue
 		}
 		seconds, err := strconv.Atoi(strings.TrimSpace(value))
+		// Treat a missing/garbage value the same as s-maxage<=0: fall back to
+		// defaultTTL. A 0s cache would re-fetch on every handshake, defeating
+		// the point of this module, and the upstream uses s-maxage purely as a
+		// positive staleness bound (it signals "no cert" via a 204, not via
+		// s-maxage=0).
 		if err != nil || seconds <= 0 {
 			return 0, false
 		}
