@@ -46,6 +46,8 @@ func (g *CachedHTTPGetter) persist(sni string, bundle []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	// No fsync before rename: this is a cache. A torn file after a crash just
+	// fails to parse on the next load and the certificate is re-fetched.
 	return os.Rename(tmpName, path)
 }
 
@@ -101,7 +103,7 @@ func sniFromFile(data []byte) (string, bool) {
 	if newline < 0 {
 		return "", false
 	}
-	first := string(data[:newline])
+	first := strings.TrimSuffix(string(data[:newline]), "\r")
 	sni, found := strings.CutPrefix(first, sniCommentPrefix)
 	if !found || sni == "" {
 		return "", false

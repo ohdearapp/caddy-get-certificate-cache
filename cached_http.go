@@ -66,6 +66,8 @@ type CachedHTTPGetter struct {
 
 	// CacheDir, when set, persists fetched certificate bundles to disk so the
 	// cache survives a restart. Files are written 0600 in a 0700 directory.
+	// The 0700 mode is applied only when this module creates the directory; if
+	// you pre-create it, restrict its permissions yourself, as it holds private keys.
 	CacheDir string `json:"cache_dir,omitempty"`
 
 	cache  *sync.Map // sni(string) -> *cacheEntry
