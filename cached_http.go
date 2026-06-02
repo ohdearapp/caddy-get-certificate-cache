@@ -349,9 +349,3 @@ var (
 	_ caddyfile.Unmarshaler = (*CachedHTTPGetter)(nil)
 	_ certmagic.Manager     = (*CachedHTTPGetter)(nil)
 )
-
-// loadFromDisk is implemented in disk.go (Task 5). Temporary stub so Task 3 compiles.
-func (g *CachedHTTPGetter) loadFromDisk() error { return nil }
-
-// persist is implemented in disk.go (Task 5). Temporary stub so this compiles.
-func (g *CachedHTTPGetter) persist(sni string, bundle []byte) error { return nil }
