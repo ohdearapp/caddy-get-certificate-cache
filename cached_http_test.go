@@ -1,6 +1,7 @@
 package cachedcert
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"net/http"
@@ -13,12 +14,16 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestUnmarshalCaddyfile(t *testing.T) {
 	input := `cached_http https://app.example.com/cert {
 		ttl 1h
 		negative_ttl 30s
+		stale_ttl 2m
 		cache_dir /var/cache/certs
 	}`
 
@@ -36,6 +41,9 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 	if time.Duration(g.NegativeTTL) != 30*time.Second {
 		t.Errorf("NegativeTTL = %v, want 30s", time.Duration(g.NegativeTTL))
+	}
+	if time.Duration(g.StaleTTL) != 2*time.Minute {
+		t.Errorf("StaleTTL = %v, want 2m", time.Duration(g.StaleTTL))
 	}
 	if g.CacheDir != "/var/cache/certs" {
 		t.Errorf("CacheDir = %q, want /var/cache/certs", g.CacheDir)
@@ -151,6 +159,17 @@ func TestNegativeTTLDefault(t *testing.T) {
 	g.NegativeTTL = caddy.Duration(5 * time.Second)
 	if got := g.negativeTTL(); got != 5*time.Second {
 		t.Errorf("negativeTTL() = %v, want 5s", got)
+	}
+}
+
+func TestStaleTTLDefault(t *testing.T) {
+	var g CachedHTTPGetter
+	if got := g.staleTTL(); got != defaultStaleTTL {
+		t.Errorf("staleTTL() = %v, want default %v", got, defaultStaleTTL)
+	}
+	g.StaleTTL = caddy.Duration(5 * time.Second)
+	if got := g.staleTTL(); got != 5*time.Second {
+		t.Errorf("staleTTL() = %v, want 5s", got)
 	}
 }
 
@@ -368,5 +387,224 @@ func TestGetCertificateIgnoresCanceledHandshakeContext(t *testing.T) {
 	}
 	if cert == nil || len(cert.Certificate) == 0 {
 		t.Fatal("expected a certificate despite the canceled handshake context")
+	}
+}
+
+// upstream is a test certificate endpoint whose response can be changed
+// between handshakes.
+type upstream struct {
+	*httptest.Server
+	hits    atomic.Int32
+	mu      sync.Mutex
+	respond http.HandlerFunc
+}
+
+func newUpstream(t *testing.T, respond http.HandlerFunc) *upstream {
+	t.Helper()
+	u := &upstream{respond: respond}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.hits.Add(1)
+		u.mu.Lock()
+		respond := u.respond
+		u.mu.Unlock()
+		respond(w, r)
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+func (u *upstream) set(respond http.HandlerFunc) {
+	u.mu.Lock()
+	u.respond = respond
+	u.mu.Unlock()
+}
+
+func serveBundle(bundle []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, s-maxage=60")
+		_, _ = w.Write(bundle)
+	}
+}
+
+func serveStatus(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(code)
+	}
+}
+
+func dropConnection(w http.ResponseWriter, r *http.Request) {
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		_ = conn.Close()
+	}
+}
+
+func TestGetCertificateServesStaleCertWhenUpstreamFails(t *testing.T) {
+	cases := []struct {
+		name    string
+		failure http.HandlerFunc
+	}{
+		{"503", serveStatus(http.StatusServiceUnavailable)},
+		{"500", serveStatus(http.StatusInternalServerError)},
+		{"unparseable body", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("<html>maintenance</html>")) }},
+		{"network error", dropConnection},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := testPEMBundle(t, "status.example.com")
+			up := newUpstream(t, serveBundle(bundle))
+
+			current := time.Now()
+			g := newTestGetter(t, up.URL)
+			g.now = func() time.Time { return current }
+
+			fresh, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			up.set(tc.failure)
+			current = current.Add(61 * time.Second)
+
+			stale, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+			if err != nil {
+				t.Fatalf("expected the stale certificate, got error: %v", err)
+			}
+			if stale != fresh {
+				t.Error("expected the last good certificate to be served")
+			}
+		})
+	}
+}
+
+func TestGetCertificateRetriesFailingUpstreamOncePerStaleTTL(t *testing.T) {
+	up := newUpstream(t, serveBundle(testPEMBundle(t, "status.example.com")))
+
+	current := time.Now()
+	core, logs := observer.New(zapcore.WarnLevel)
+	g := newTestGetter(t, up.URL)
+	g.now = func() time.Time { return current }
+	g.logger = zap.New(core)
+	g.StaleTTL = caddy.Duration(30 * time.Second)
+
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+	up.set(serveStatus(http.StatusServiceUnavailable))
+	current = current.Add(61 * time.Second)
+
+	for i := 0; i < 5; i++ {
+		if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		current = current.Add(5 * time.Second)
+	}
+	if got := up.hits.Load(); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (one fetch, one failed fetch, then stale_ttl holds)", got)
+	}
+	if got := logs.Len(); got != 1 {
+		t.Errorf("warnings = %d, want 1 per stale_ttl", got)
+	}
+
+	current = current.Add(30 * time.Second)
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+	if got := up.hits.Load(); got != 3 {
+		t.Errorf("upstream hits = %d, want 3 (retry once stale_ttl runs out)", got)
+	}
+	if got := logs.Len(); got != 2 {
+		t.Errorf("warnings = %d, want 2 after the second failed retry", got)
+	}
+	if got := logs.All()[0].ContextMap()["sni"]; got != "status.example.com" {
+		t.Errorf("warning sni = %v, want status.example.com", got)
+	}
+
+	renewed := testPEMBundle(t, "status.example.com")
+	up.set(serveBundle(renewed))
+	current = current.Add(31 * time.Second)
+
+	cert, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := tlsCertFromCertAndKeyPEMBundle(renewed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cert.Certificate[0], want.Certificate[0]) {
+		t.Error("expected the renewed certificate once the upstream recovers")
+	}
+}
+
+func TestGetCertificateDoesNotServeStaleCertAfterNoContent(t *testing.T) {
+	up := newUpstream(t, serveBundle(testPEMBundle(t, "status.example.com")))
+
+	current := time.Now()
+	g := newTestGetter(t, up.URL)
+	g.now = func() time.Time { return current }
+
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	up.set(serveStatus(http.StatusNoContent))
+	current = current.Add(61 * time.Second)
+	cert, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert != nil {
+		t.Fatal("expected no certificate after a 204")
+	}
+
+	up.set(serveStatus(http.StatusServiceUnavailable))
+	current = current.Add(61 * time.Second)
+	cert, err = g.GetCertificate(context.Background(), helloFor("status.example.com"))
+	if err == nil {
+		t.Fatal("expected the upstream error, not a stale certificate from before the 204")
+	}
+	if cert != nil {
+		t.Fatal("expected no certificate")
+	}
+}
+
+func TestGetCertificateDoesNotServeExpiredStaleCert(t *testing.T) {
+	up := newUpstream(t, serveBundle(testPEMBundle(t, "status.example.com")))
+
+	current := time.Now()
+	g := newTestGetter(t, up.URL)
+	g.now = func() time.Time { return current }
+
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	up.set(serveStatus(http.StatusServiceUnavailable))
+	current = current.AddDate(11, 0, 0)
+
+	cert, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+	if err == nil {
+		t.Fatal("expected the upstream error once the stale certificate is past its NotAfter")
+	}
+	if cert != nil {
+		t.Fatal("expected no certificate")
+	}
+}
+
+func TestCertNotAfterParsesLeafWhenMissing(t *testing.T) {
+	cert, err := tlsCertFromCertAndKeyPEMBundle(testPEMBundle(t, "status.example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := cert.Leaf.NotAfter
+	cert.Leaf = nil
+
+	got, err := certNotAfter(&cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(want) {
+		t.Errorf("certNotAfter = %v, want %v", got, want)
 	}
 }

@@ -6,6 +6,7 @@ package cachedcert
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +32,10 @@ const (
 	// defaultNegativeTTL is how long a 204 ("no certificate here") response is
 	// remembered when no negative_ttl is configured.
 	defaultNegativeTTL = 60 * time.Second
+
+	// defaultStaleTTL is how long a stale certificate is served after a failed
+	// fetch before the upstream is tried again, when no stale_ttl is configured.
+	defaultStaleTTL = 60 * time.Second
 
 	// fetchTimeout bounds an upstream certificate fetch so a slow backend
 	// cannot block TLS handshakes indefinitely.
@@ -62,6 +67,14 @@ type CachedHTTPGetter struct {
 	// NegativeTTL is how long a 204 (no certificate) response is cached. When
 	// zero, defaultNegativeTTL is used.
 	NegativeTTL caddy.Duration `json:"negative_ttl,omitempty"`
+
+	// StaleTTL is how long the last good certificate is served after a fetch
+	// fails (a network error, a timeout, a non-200/204 status or a body that
+	// does not parse). The upstream is tried again once it runs out, so a
+	// failing upstream gets at most one request per name per StaleTTL. A stale
+	// certificate is only served while it is itself valid (before its NotAfter).
+	// When zero, defaultStaleTTL is used.
+	StaleTTL caddy.Duration `json:"stale_ttl,omitempty"`
 
 	// CacheDir, when set, persists fetched certificate bundles to disk so the
 	// cache survives a restart. Files are written 0600 in a 0700 directory.
@@ -121,6 +134,7 @@ func (g *CachedHTTPGetter) Validate() error {
 //	cached_http <url> {
 //	    ttl          <duration>
 //	    negative_ttl <duration>
+//	    stale_ttl    <duration>
 //	    cache_dir    <path>
 //	}
 func (g *CachedHTTPGetter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -153,6 +167,15 @@ func (g *CachedHTTPGetter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("parsing negative_ttl: %v", err)
 			}
 			g.NegativeTTL = caddy.Duration(dur)
+		case "stale_ttl":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("parsing stale_ttl: %v", err)
+			}
+			g.StaleTTL = caddy.Duration(dur)
 		case "cache_dir":
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -180,6 +203,13 @@ func (g *CachedHTTPGetter) negativeTTL() time.Duration {
 		return time.Duration(g.NegativeTTL)
 	}
 	return defaultNegativeTTL
+}
+
+func (g *CachedHTTPGetter) staleTTL() time.Duration {
+	if g.StaleTTL > 0 {
+		return time.Duration(g.StaleTTL)
+	}
+	return defaultStaleTTL
 }
 
 // parseSMaxAge extracts the s-maxage value (in seconds) from a Cache-Control
@@ -251,7 +281,11 @@ func (g *CachedHTTPGetter) GetCertificate(ctx context.Context, hello *tls.Client
 		if entry, ok := g.load(sni); ok {
 			return fetchResult{cert: entry.cert, negative: entry.negative}, nil
 		}
-		return g.fetch(sni, hello)
+		res, err := g.fetch(sni, hello)
+		if err != nil {
+			return g.serveStale(sni, err)
+		}
+		return res, nil
 	})
 	if err != nil {
 		return nil, err
@@ -315,10 +349,13 @@ func (g *CachedHTTPGetter) fetch(sni string, hello *tls.ClientHelloInfo) (fetchR
 
 	if resp.StatusCode == http.StatusNoContent {
 		g.store(sni, &cacheEntry{negative: true, expires: g.now().Add(g.negativeTTL())})
+		if g.CacheDir != "" {
+			g.forget(sni)
+		}
 		return fetchResult{negative: true}, nil
 	}
-	// Deliberately do not cache errors: a transient upstream failure should
-	// self-heal on the next handshake rather than be pinned for a TTL.
+	// The error itself is not cached. When a last good certificate exists,
+	// serveStale caches that instead; otherwise the next handshake retries.
 	if resp.StatusCode != http.StatusOK {
 		return fetchResult{}, fmt.Errorf("got HTTP %d", resp.StatusCode)
 	}
@@ -344,6 +381,72 @@ func (g *CachedHTTPGetter) fetch(sni string, hello *tls.ClientHelloInfo) (fetchR
 	}
 
 	return fetchResult{cert: &cert}, nil
+}
+
+// serveStale is called when a fetch for sni fails. It returns the last good
+// certificate for sni, so an upstream outage does not fail the TLS handshake.
+// That certificate is cached again for stale_ttl, which means the failing
+// upstream is retried at most once per stale_ttl and the warning below is
+// logged once per retry, not once per handshake. Without a last good
+// certificate, or once that certificate has expired, fetchErr is returned.
+func (g *CachedHTTPGetter) serveStale(sni string, fetchErr error) (fetchResult, error) {
+	cert, ok := g.lastGoodCert(sni)
+	if !ok {
+		return fetchResult{}, fetchErr
+	}
+	notAfter, err := certNotAfter(cert)
+	if err != nil {
+		return fetchResult{}, fetchErr
+	}
+	now := g.now()
+	if !now.Before(notAfter) {
+		return fetchResult{}, fetchErr
+	}
+
+	g.store(sni, &cacheEntry{cert: cert, expires: now.Add(g.staleTTL())})
+	if g.logger != nil {
+		g.logger.Warn("upstream certificate fetch failed, serving the last good certificate",
+			zap.String("sni", sni),
+			zap.Error(fetchErr),
+			zap.Time("not_after", notAfter),
+			zap.Duration("retry_in", g.staleTTL()))
+	}
+	return fetchResult{cert: cert}, nil
+}
+
+// lastGoodCert returns the most recent certificate fetched for sni. It looks in
+// memory first, where an expired entry is still kept, and then in cache_dir. A
+// 204 replaces the entry in memory with a negative one and removes the file in
+// cache_dir, so after a 204 there is no last good certificate.
+func (g *CachedHTTPGetter) lastGoodCert(sni string) (*tls.Certificate, bool) {
+	if v, ok := g.cache.Load(sni); ok {
+		entry := v.(*cacheEntry)
+		if entry.negative {
+			return nil, false
+		}
+		return entry.cert, entry.cert != nil
+	}
+	if g.CacheDir == "" {
+		return nil, false
+	}
+	return g.readFromDisk(sni)
+}
+
+// certNotAfter returns the expiry of the leaf certificate. tls.X509KeyPair
+// fills in Leaf since Go 1.23, but the x509keypairleaf=0 GODEBUG setting turns
+// that off, so the leaf is parsed here when it is missing.
+func certNotAfter(cert *tls.Certificate) (time.Time, error) {
+	if cert.Leaf != nil {
+		return cert.Leaf.NotAfter, nil
+	}
+	if len(cert.Certificate) == 0 {
+		return time.Time{}, fmt.Errorf("no certificate in chain")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return time.Time{}, err
+	}
+	return leaf.NotAfter, nil
 }
 
 // Interface guards.

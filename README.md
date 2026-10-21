@@ -52,6 +52,7 @@ tls {
     get_certificate cached_http https://app.example.com/cert {
         ttl          1h
         negative_ttl 60s
+        stale_ttl    60s
         cache_dir    /var/cache/caddy-certs
     }
     on_demand
@@ -63,20 +64,42 @@ tls {
 | (argument) | URL | — (required) | Endpoint queried on a cache miss. `server_name`, `signature_schemes`, `cipher_suites` (and `local_ip` when available) are added as query parameters, identical to the stock `http` getter. |
 | `ttl` | duration | from response | How long a fetched certificate is cached. When omitted, the `s-maxage` of the response's `Cache-Control` header is used, falling back to `60s`. |
 | `negative_ttl` | duration | `60s` | How long a `204` ("no certificate for this name") response is remembered before re-querying. |
+| `stale_ttl` | duration | `60s` | How long the last good certificate is served after a failed fetch before the upstream is tried again. See [When the upstream fails](#when-the-upstream-fails). |
 | `cache_dir` | path | (disabled) | If set, fetched certificate bundles are persisted here (`0600` files in a `0700` directory) and loaded on startup, so the cache survives restarts. **Contains private keys.** |
 
 ### Behaviour
 
 - **HTTP 200**: response body is parsed as a PEM bundle (certificate chain + private key) and cached.
 - **HTTP 204**: cached as a negative entry for `negative_ttl`; the handshake falls through to
-  Caddy's on-demand / `ask` flow.
-- **Any other status, or a parse error**: returned as an error and **not** cached, so a transient
-  upstream failure is retried on the next handshake.
+  Caddy's on-demand / `ask` flow. The certificate for that name is also removed from `cache_dir`.
+- **Any other status, a network error, a timeout or a parse error**: the fetch has failed. See
+  below.
 - Concurrent cache misses for the same name are coalesced into a single upstream request.
 - Each upstream fetch is bounded by a 10s timeout, and it does not inherit the per-handshake
   context, so one client disconnecting cannot cancel a fetch that other handshakes are waiting on.
 - Entries loaded from `cache_dir` on startup are re-aged: they get a fresh TTL on load (the
   original `Cache-Control` is not persisted), so a warm-restart entry re-validates within one TTL.
+
+### When the upstream fails
+
+A failed fetch does not fail the handshake when there is a last good certificate for the name.
+The module serves that certificate instead, and logs a warning:
+
+```
+upstream certificate fetch failed, serving the last good certificate  {"sni": "status.example.com", "error": "got HTTP 503", ...}
+```
+
+- The last good certificate comes from memory. When memory has nothing for the name, it is read
+  from `cache_dir`.
+- It is only served while it is still valid. Once its `NotAfter` has passed, the fetch error is
+  returned and the handshake fails.
+- It is cached for `stale_ttl`. The upstream is tried again once that runs out. So a failing
+  upstream gets at most one request per name per `stale_ttl`, and the warning is logged once per
+  name per `stale_ttl`, not once per handshake.
+- A 204 still means "no certificate". After a 204 there is no last good certificate for that name,
+  so an outage after a 204 fails the handshake.
+- With no last good certificate, the error is returned and **not** cached, so the next handshake
+  tries the upstream again.
 
 ## Running the tests
 

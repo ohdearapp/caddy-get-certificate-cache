@@ -14,6 +14,7 @@ func ExampleCachedHTTPGetter() {
 		URL:         "https://app.example.com/cert",
 		TTL:         caddy.Duration(time.Hour),
 		NegativeTTL: caddy.Duration(time.Minute),
+		StaleTTL:    caddy.Duration(time.Minute),
 		CacheDir:    "/var/cache/caddy-certs",
 	}
 	_ = getter
