@@ -1,6 +1,9 @@
 package cachedcert
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -127,5 +130,59 @@ func TestLoadFromDiskSkipsBadFilesAndTempFiles(t *testing.T) {
 	reader.cache.Range(func(_, _ any) bool { count++; return true })
 	if count != 1 {
 		t.Errorf("expected exactly 1 warm entry, got %d", count)
+	}
+}
+
+func TestServeStaleFallsBackToCacheDir(t *testing.T) {
+	dir := t.TempDir()
+	up := newUpstream(t, serveStatus(http.StatusServiceUnavailable))
+
+	writer := &CachedHTTPGetter{CacheDir: dir, cache: new(sync.Map), now: time.Now}
+	if err := writer.persist("status.example.com", testPEMBundle(t, "status.example.com")); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	g := newTestGetter(t, up.URL)
+	g.CacheDir = dir
+
+	cert, err := g.GetCertificate(context.Background(), helloFor("status.example.com"))
+	if err != nil {
+		t.Fatalf("expected the certificate from cache_dir, got error: %v", err)
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		t.Fatal("expected a certificate")
+	}
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+	if got := up.hits.Load(); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (the stale certificate is cached for stale_ttl)", got)
+	}
+}
+
+func TestNoContentRemovesPersistedCert(t *testing.T) {
+	dir := t.TempDir()
+	up := newUpstream(t, serveBundle(testPEMBundle(t, "status.example.com")))
+
+	current := time.Now()
+	g := newTestGetter(t, up.URL)
+	g.CacheDir = dir
+	g.now = func() time.Time { return current }
+
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(g.diskPath("status.example.com")); err != nil {
+		t.Fatalf("expected the certificate to be persisted: %v", err)
+	}
+
+	up.set(serveStatus(http.StatusNoContent))
+	current = current.Add(61 * time.Second)
+	if _, err := g.GetCertificate(context.Background(), helloFor("status.example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(g.diskPath("status.example.com")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected the persisted certificate to be removed after a 204, stat err: %v", err)
 	}
 }

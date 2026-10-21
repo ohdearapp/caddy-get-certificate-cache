@@ -3,7 +3,10 @@ package cachedcert
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,27 +72,63 @@ func (g *CachedHTTPGetter) loadFromDisk() error {
 			continue
 		}
 		path := filepath.Join(g.CacheDir, entry.Name())
-		data, err := os.ReadFile(path)
+		sni, cert, err := readBundleFile(path)
 		if err != nil {
-			g.warn("reading cached certificate failed", path, err)
+			g.warn("loading cached certificate failed, skipping", path, err)
 			continue
 		}
 
-		sni, ok := sniFromFile(data)
-		if !ok {
-			g.warn("cached certificate missing sni header, skipping", path, nil)
-			continue
-		}
-
-		cert, err := tlsCertFromCertAndKeyPEMBundle(data)
-		if err != nil {
-			g.warn("parsing cached certificate failed", path, err)
-			continue
-		}
-
-		g.store(sni, &cacheEntry{cert: &cert, expires: g.now().Add(g.ttlFor(""))})
+		g.store(sni, &cacheEntry{cert: cert, expires: g.now().Add(g.ttlFor(""))})
 	}
 	return nil
+}
+
+// readFromDisk returns the certificate persisted in cache_dir for sni. A
+// missing file is the normal case for a name that was never fetched, so only
+// other problems are logged.
+func (g *CachedHTTPGetter) readFromDisk(sni string) (*tls.Certificate, bool) {
+	path := g.diskPath(sni)
+	fileSNI, cert, err := readBundleFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false
+	}
+	if err != nil {
+		g.warn("loading cached certificate failed", path, err)
+		return nil, false
+	}
+	if fileSNI != sni {
+		g.warn("cached certificate belongs to another sni, skipping", path, nil)
+		return nil, false
+	}
+	return cert, true
+}
+
+// forget removes the certificate persisted in cache_dir for sni. It runs after
+// a 204, so a restart cannot load a certificate the upstream no longer serves,
+// and an outage after the 204 cannot serve it as a stale certificate either.
+func (g *CachedHTTPGetter) forget(sni string) {
+	path := g.diskPath(sni)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		g.warn("removing cached certificate failed", path, err)
+	}
+}
+
+// readBundleFile parses one file written by persist into its SNI and
+// certificate.
+func readBundleFile(path string) (string, *tls.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, err
+	}
+	sni, ok := sniFromFile(data)
+	if !ok {
+		return "", nil, fmt.Errorf("missing sni header")
+	}
+	cert, err := tlsCertFromCertAndKeyPEMBundle(data)
+	if err != nil {
+		return "", nil, fmt.Errorf("parsing certificate: %w", err)
+	}
+	return sni, &cert, nil
 }
 
 func (g *CachedHTTPGetter) diskPath(sni string) string {
