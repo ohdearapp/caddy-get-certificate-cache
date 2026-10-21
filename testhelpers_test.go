@@ -13,8 +13,8 @@ import (
 )
 
 // testPEMBundle returns a self-signed cert + PKCS#8 key as a single PEM bundle
-// (certificate block followed by a "PRIVATE KEY" block), mirroring the origin
-// certificates the Oh Dear app serves.
+// (certificate block followed by a "PRIVATE KEY" block). That is the response
+// body shape the upstream endpoint is expected to return.
 func testPEMBundle(t *testing.T, host string) []byte {
 	t.Helper()
 
